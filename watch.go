@@ -48,7 +48,7 @@ func (w *WatchPlan) Watch(log *zap.Logger, consulAddr, name, dc, tag string) (<-
 	w.plan = plan
 	w.plan.LogOutput = &LogWriter{log.With(zap.String("module", "consul_watcher"))}
 	w.plan.Handler = func(i uint64, data interface{}) {
-		var addrs Addresses
+		var addrs []Address
 		for _, srv := range data.([]*api.ServiceEntry) {
 			host := srv.Service.Address
 			if host != "" {
