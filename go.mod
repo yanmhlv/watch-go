@@ -1,4 +1,4 @@
-module github.com/yanmhlv/watch-go
+module github.com/ian-mikhailov/watch-go
 
 go 1.12
 
