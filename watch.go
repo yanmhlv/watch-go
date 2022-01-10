@@ -33,6 +33,8 @@ type (
 	}
 )
 
+var _ Watcher = (*ConsulWatcher)(nil)
+
 func (w *logger) Write(data []byte) (int, error) {
 	w.logger.Warn(string(data))
 	return len(data), nil
