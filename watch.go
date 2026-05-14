@@ -1,47 +1,47 @@
 package watch
 
 import (
+	"context"
+	"fmt"
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 
 	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/consul/api/watch"
 	"go.uber.org/zap"
 )
 
-type (
-	Address = string
+type Watcher interface {
+	Watch() <-chan []string
+}
 
-	Watcher interface {
-		Watch() (<-chan []Address, error)
-	}
+type ConsulWatcher struct {
+	logger     *zap.Logger
+	plan       *watch.Plan
+	consulAddr string
 
-	ConsulWatcher struct {
-		logger     *zap.Logger
-		plan       *watch.Plan
-		consulAddr Address
-
-		once sync.Once
-
-		ch  chan []Address
-		err error
-	}
-
-	logger struct {
-		logger *zap.Logger
-	}
-)
+	ch    chan []string
+	err   atomic.Pointer[error]
+	start func() <-chan []string
+	stop  func() bool
+	close func()
+}
 
 var _ Watcher = (*ConsulWatcher)(nil)
 
-func (w *logger) Write(data []byte) (int, error) {
+type zapWriter struct {
+	logger *zap.Logger
+}
+
+func (w *zapWriter) Write(data []byte) (int, error) {
 	w.logger.Warn(string(data))
 	return len(data), nil
 }
 
-func NewConsulWatcher(log *zap.Logger, consulAddr, name, dc, tag string) (*ConsulWatcher, error) {
-	plan, err := watch.Parse(map[string]interface{}{
+func NewConsulWatcher(ctx context.Context, log *zap.Logger, consulAddr, name, dc, tag string) (*ConsulWatcher, error) {
+	plan, err := watch.Parse(map[string]any{
 		"type":        "service",
 		"service":     name,
 		"datacenter":  dc,
@@ -54,37 +54,73 @@ func NewConsulWatcher(log *zap.Logger, consulAddr, name, dc, tag string) (*Consu
 
 	w := &ConsulWatcher{
 		logger:     log,
-		consulAddr: consulAddr,
 		plan:       plan,
-		ch:         make(chan []Address),
+		consulAddr: consulAddr,
+		ch:         make(chan []string, 1),
 	}
-	w.plan.LogOutput = &logger{log.With(zap.String("module", "consul_watcher"))}
-	w.plan.Handler = func(i uint64, data interface{}) {
-		var addrs []Address
-		for _, srv := range data.([]*api.ServiceEntry) {
+	plan.LogOutput = &zapWriter{log.With(zap.String("module", "consul_watcher"))}
+	plan.Handler = func(_ uint64, data any) {
+		entries, ok := data.([]*api.ServiceEntry)
+		if !ok {
+			log.Warn("unexpected watch payload", zap.String("type", fmt.Sprintf("%T", data)))
+			return
+		}
+		addrs := make([]string, 0, len(entries))
+		for _, srv := range entries {
 			host := srv.Service.Address
 			if host == "" {
 				host = srv.Node.Address
 			}
-
 			addrs = append(addrs, net.JoinHostPort(host, strconv.Itoa(srv.Service.Port)))
 		}
-		w.ch <- addrs
+		coalesce(w.ch, addrs)
 	}
+
+	w.start = sync.OnceValue(func() <-chan []string {
+		go func() {
+			defer close(w.ch)
+			if runErr := plan.Run(consulAddr); runErr != nil {
+				w.err.Store(&runErr)
+				log.Error("watch plan exited", zap.String("consul_address", consulAddr), zap.Error(runErr))
+			}
+		}()
+		return w.ch
+	})
+	w.stop = context.AfterFunc(ctx, func() { plan.Stop() })
+	w.close = sync.OnceFunc(func() {
+		if w.stop() {
+			plan.Stop()
+		}
+	})
 
 	return w, nil
 }
 
-func (w *ConsulWatcher) Watch() (<-chan []Address, error) {
-	w.once.Do(func() {
-		go func() {
-			defer func() { close(w.ch) }()
-			if err := w.plan.Run(w.consulAddr); err != nil {
-				w.err = err
-				w.logger.Error("running watch plan error", zap.String("consul_address", w.consulAddr), zap.Error(w.err))
-			}
-		}()
-	})
+func (w *ConsulWatcher) Watch() <-chan []string {
+	return w.start()
+}
 
-	return w.ch, w.err
+func (w *ConsulWatcher) Err() error {
+	if p := w.err.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+func (w *ConsulWatcher) Close() {
+	w.close()
+}
+
+// coalesce sends addrs on a cap=1 channel, replacing any unread snapshot.
+// Safe only with a single producer.
+func coalesce(ch chan []string, addrs []string) {
+	select {
+	case ch <- addrs:
+	default:
+		select {
+		case <-ch:
+		default:
+		}
+		ch <- addrs
+	}
 }
