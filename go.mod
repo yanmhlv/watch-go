@@ -1,6 +1,6 @@
 module github.com/yanmhlv/watch-go
 
-go 1.17
+go 1.26
 
 require (
 	github.com/hashicorp/consul/api v1.12.0
