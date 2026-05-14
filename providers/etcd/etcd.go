@@ -1,4 +1,5 @@
-package watch
+// Package etcd provides an etcd-backed watch.Watcher over a key prefix.
+package etcd
 
 import (
 	"context"
@@ -10,9 +11,11 @@ import (
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
+
+	watchgo "github.com/yanmhlv/watch-go"
 )
 
-type EtcdWatcher struct {
+type Watcher struct {
 	logger *zap.Logger
 	client *clientv3.Client
 	prefix string
@@ -23,11 +26,11 @@ type EtcdWatcher struct {
 	close func()
 }
 
-var _ Watcher = (*EtcdWatcher)(nil)
+var _ watchgo.Watcher = (*Watcher)(nil)
 
-// NewEtcdWatcher watches all keys under prefix; each value is treated as an
-// address ("host:port"). Emits the sorted set of current values on every change.
-func NewEtcdWatcher(ctx context.Context, log *zap.Logger, endpoints []string, prefix string) (*EtcdWatcher, error) {
+// New watches all keys under prefix; each value is treated as an address
+// ("host:port"). Emits the sorted set of current values on every change.
+func New(ctx context.Context, log *zap.Logger, endpoints []string, prefix string) (*Watcher, error) {
 	cli, err := clientv3.New(clientv3.Config{
 		Endpoints:   endpoints,
 		DialTimeout: 5 * time.Second,
@@ -38,7 +41,7 @@ func NewEtcdWatcher(ctx context.Context, log *zap.Logger, endpoints []string, pr
 	}
 
 	runCtx, cancel := context.WithCancel(ctx)
-	w := &EtcdWatcher{
+	w := &Watcher{
 		logger: log,
 		client: cli,
 		prefix: prefix,
@@ -56,7 +59,7 @@ func NewEtcdWatcher(ctx context.Context, log *zap.Logger, endpoints []string, pr
 	return w, nil
 }
 
-func (w *EtcdWatcher) run(ctx context.Context) {
+func (w *Watcher) run(ctx context.Context) {
 	defer close(w.ch)
 
 	resp, err := w.client.Get(ctx, w.prefix, clientv3.WithPrefix())
@@ -94,13 +97,27 @@ func (w *EtcdWatcher) run(ctx context.Context) {
 	}
 }
 
-func (w *EtcdWatcher) Watch() <-chan []string { return w.start() }
+func (w *Watcher) Watch() <-chan []string { return w.start() }
 
-func (w *EtcdWatcher) Err() error {
+func (w *Watcher) Err() error {
 	if p := w.err.Load(); p != nil {
 		return *p
 	}
 	return nil
 }
 
-func (w *EtcdWatcher) Close() { w.close() }
+func (w *Watcher) Close() { w.close() }
+
+// coalesce sends addrs on a cap=1 channel, replacing any unread snapshot.
+// Safe only with a single producer.
+func coalesce(ch chan []string, addrs []string) {
+	select {
+	case ch <- addrs:
+	default:
+		select {
+		case <-ch:
+		default:
+		}
+		ch <- addrs
+	}
+}
